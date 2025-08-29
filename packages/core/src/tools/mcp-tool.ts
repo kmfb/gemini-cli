@@ -4,17 +4,22 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import {
-  BaseDeclarativeTool,
-  BaseToolInvocation,
-  Kind,
+import { safeJsonStringify } from '../utils/safeJsonStringify.js';
+import type {
   ToolCallConfirmationDetails,
-  ToolConfirmationOutcome,
   ToolInvocation,
   ToolMcpConfirmationDetails,
   ToolResult,
 } from './tools.js';
-import { CallableTool, FunctionCall, Part } from '@google/genai';
+import {
+  BaseDeclarativeTool,
+  BaseToolInvocation,
+  Kind,
+  ToolConfirmationOutcome,
+} from './tools.js';
+import type { CallableTool, FunctionCall, Part } from '@google/genai';
+import { ToolErrorType } from './tool-error.js';
+import type { Config } from '../config/config.js';
 
 type ToolParams = Record<string, unknown>;
 
@@ -66,6 +71,7 @@ class DiscoveredMCPToolInvocation extends BaseToolInvocation<
     readonly timeout?: number,
     readonly trust?: boolean,
     params: ToolParams = {},
+    private readonly cliConfig?: Config,
   ) {
     super(params);
   }
@@ -76,7 +82,9 @@ class DiscoveredMCPToolInvocation extends BaseToolInvocation<
     const serverAllowListKey = this.serverName;
     const toolAllowListKey = `${this.serverName}.${this.serverToolName}`;
 
-    if (this.trust) {
+    const isTrustedFolder = this.cliConfig?.isTrustedFolder() !== false;
+
+    if (this.trust && isTrustedFolder) {
       return false; // server is trusted, no confirmation needed
     }
 
@@ -104,6 +112,28 @@ class DiscoveredMCPToolInvocation extends BaseToolInvocation<
     return confirmationDetails;
   }
 
+  // Determine if the response contains tool errors
+  // This is needed because CallToolResults should return errors inside the response.
+  // ref: https://modelcontextprotocol.io/specification/2025-06-18/schema#calltoolresult
+  isMCPToolError(rawResponseParts: Part[]): boolean {
+    const functionResponse = rawResponseParts?.[0]?.functionResponse;
+    const response = functionResponse?.response;
+
+    interface McpError {
+      isError?: boolean | string;
+    }
+
+    if (response) {
+      const error = (response as { error?: McpError })?.error;
+      const isError = error?.isError;
+
+      if (error && (isError === true || isError === 'true')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   async execute(): Promise<ToolResult> {
     const functionCalls: FunctionCall[] = [
       {
@@ -113,6 +143,24 @@ class DiscoveredMCPToolInvocation extends BaseToolInvocation<
     ];
 
     const rawResponseParts = await this.mcpTool.callTool(functionCalls);
+
+    // Ensure the response is not an error
+    if (this.isMCPToolError(rawResponseParts)) {
+      const errorMessage = `MCP tool '${
+        this.serverToolName
+      }' reported tool error for function call: ${safeJsonStringify(
+        functionCalls[0],
+      )} with response: ${safeJsonStringify(rawResponseParts)}`;
+      return {
+        llmContent: errorMessage,
+        returnDisplay: `Error: MCP tool '${this.serverToolName}' reported an error.`,
+        error: {
+          message: errorMessage,
+          type: ToolErrorType.MCP_TOOL_ERROR,
+        },
+      };
+    }
+
     const transformedParts = transformMcpContentToParts(rawResponseParts);
 
     return {
@@ -122,7 +170,7 @@ class DiscoveredMCPToolInvocation extends BaseToolInvocation<
   }
 
   getDescription(): string {
-    return this.displayName;
+    return safeJsonStringify(this.params);
   }
 }
 
@@ -139,6 +187,7 @@ export class DiscoveredMCPTool extends BaseDeclarativeTool<
     readonly timeout?: number,
     readonly trust?: boolean,
     nameOverride?: string,
+    private readonly cliConfig?: Config,
   ) {
     super(
       nameOverride ?? generateValidName(serverToolName),
@@ -161,6 +210,7 @@ export class DiscoveredMCPTool extends BaseDeclarativeTool<
       this.timeout,
       this.trust,
       `${this.serverName}__${this.serverToolName}`,
+      this.cliConfig,
     );
   }
 
@@ -175,6 +225,7 @@ export class DiscoveredMCPTool extends BaseDeclarativeTool<
       this.timeout,
       this.trust,
       params,
+      this.cliConfig,
     );
   }
 }
@@ -241,7 +292,7 @@ function transformResourceLinkBlock(block: McpResourceLinkBlock): Part {
  */
 function transformMcpContentToParts(sdkResponse: Part[]): Part[] {
   const funcResponse = sdkResponse?.[0]?.functionResponse;
-  const mcpContent = funcResponse?.response?.content as McpContentBlock[];
+  const mcpContent = funcResponse?.response?.['content'] as McpContentBlock[];
   const toolName = funcResponse?.name || 'unknown tool';
 
   if (!Array.isArray(mcpContent)) {
@@ -278,8 +329,9 @@ function transformMcpContentToParts(sdkResponse: Part[]): Part[] {
  * @returns A formatted string representing the tool's output.
  */
 function getStringifiedResultForDisplay(rawResponse: Part[]): string {
-  const mcpContent = rawResponse?.[0]?.functionResponse?.response
-    ?.content as McpContentBlock[];
+  const mcpContent = rawResponse?.[0]?.functionResponse?.response?.[
+    'content'
+  ] as McpContentBlock[];
 
   if (!Array.isArray(mcpContent)) {
     return '```json\n' + JSON.stringify(rawResponse, null, 2) + '\n```';
